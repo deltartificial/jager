@@ -2,6 +2,7 @@
 
 use std::ffi::{c_int, c_uint, c_void};
 use std::mem::{MaybeUninit, size_of};
+use std::sync::Mutex;
 
 pub const NAME_LEN: usize = 32;
 
@@ -232,19 +233,21 @@ fn task_all_info(pid: u32) -> Option<ProcTaskAllInfo> {
 
 /// Calls `f` for every readable process. Returns how many were unreadable
 /// (typically other users' processes when not root).
+const MAX_PIDS: usize = 16_384;
+
 pub fn scan(mut f: impl FnMut(Proc)) -> usize {
-    let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
-    if count <= 0 {
-        return 0;
-    }
-    let mut pids: Vec<i32> = vec![0; count as usize + 64];
-    let bytes = (pids.len() * size_of::<i32>()) as c_int;
-    let n = unsafe { proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-    pids.truncate(n.max(0) as usize);
+    // A zeroed static lives in BSS: only the pages the kernel actually writes
+    // (n * 4 bytes) become resident. On the stack, probes would touch all of it.
+    static PIDS: Mutex<[i32; MAX_PIDS]> = Mutex::new([0; MAX_PIDS]);
+    let mut buf = PIDS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = unsafe {
+        proc_listallpids(buf.as_mut_ptr().cast(), (MAX_PIDS * size_of::<i32>()) as c_int)
+    };
+    let pids = &buf[..(n.max(0) as usize).min(MAX_PIDS)];
 
     let (numer, denom) = timebase();
     let mut unreadable = 0;
-    for &pid in &pids {
+    for &pid in pids {
         if pid <= 0 {
             continue;
         }
