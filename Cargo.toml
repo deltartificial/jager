@@ -1,0 +1,8 @@
+[package]
+name = "jager"
+version = "0.1.0"
+edition = "2024"
+description = "Hunts macOS processes that have been running for too long"
+
+# Zero dependencies: direct FFI into libSystem.
+[dependencies]
