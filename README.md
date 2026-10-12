@@ -3,8 +3,19 @@
 A resident macOS hunter for processes that have been running for too long: infinite loops, `node` servers that won't die, never-ending queries, memory hogs. It runs all the time, decides on its own, and kills them.
 
 - Zero dependencies: direct FFI into `libproc` / `sysctl` (libSystem).
-- **~1.6 MB physical footprint**, flat over time (no allocation growth).
-- **~0.66 ms CPU per scan** of ~500 processes → ~80 ms of CPU per hour at the default 30 s interval.
+- **865 KB physical footprint**, flat over time: 48 KB above an empty Rust program (817 KB) on the same machine.
+- **~0.58 ms CPU per scan** of ~500 processes → ~70 ms of CPU per hour at the default 30 s interval.
+
+## Why it is that small
+
+| Technique | Saved |
+|---|---|
+| `MallocNanoZone=0` (set in the LaunchAgent, or via a one-time self re-exec) | ~380 KB |
+| pid list in a zeroed `static` (BSS) instead of the stack: stack probes would dirty the whole 64 KB | ~110 KB |
+| UTC log timestamps: `localtime_r` would load the tz database (~80 KB, resident forever) | ~80 KB |
+| zero allocation per tick: sorted `Vec` of 32-byte tracks allocated once (no `HashMap`), log lines and argv formatted into stack buffers, argv read through `mmap`/`munmap`, notifications via `posix_spawn` with an empty env | growth → flat |
+
+Before: 1953 KB and growing. After: 865 KB, flat over 900 ticks.
 
 ## Install
 
@@ -27,11 +38,11 @@ A process is killed when **all** of these hold:
 
 It gets `SIGTERM`, then `SIGKILL` if still alive after `--grace` (15 s). Before each signal the pid's start time and owner are re-checked, so a recycled pid is never hit. After the machine sleeps, CPU counters are rebased so the time spent asleep never counts as "hot". Zombies and stopped processes are reported by `scan` but not killed.
 
-Every decision goes to `~/Library/Logs/jager.log` (rotated at 1 MiB), plus a macOS notification:
+Every decision goes to `~/Library/Logs/jager.log` (rotated at 1 MiB, UTC timestamps; `jager status` shows them in local time), plus a macOS notification:
 
 ```
-2026-10-12 23:29:50 TERM pid=58058 age=5h00m cpu=100% rss=2M hot-for=10m00s cmd=/bin/sh -c ...
-2026-10-12 23:30:05 KILL pid=58058 age=5h00m cpu=100% rss=2M hot-for=0s cmd=/bin/sh -c ...
+2026-10-12 21:29:50Z TERM pid=58058 age=5h00m cpu=100% rss=2M hot-for=10m00s cmd=/bin/sh -c ...
+2026-10-12 21:30:05Z KILL pid=58058 age=5h00m cpu=100% rss=2M hot-for=0s cmd=/bin/sh -c ...
 ```
 
 ## One-shot report (`jager scan`)
