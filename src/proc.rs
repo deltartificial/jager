@@ -73,16 +73,19 @@ pub(crate) fn blank() -> Proc {
     }
 }
 
-/// Append `bytes` to `out`, replacing invalid UTF-8 and control chars,
-/// stopping once `out` holds `max` chars.
-fn push_clean(out: &mut String, bytes: &[u8], max: usize) {
-    let mut n = out.chars().count();
-    for ch in String::from_utf8_lossy(bytes).chars() {
-        if n >= max {
-            return;
+/// Appends `bytes` to `out` as text: invalid UTF-8 becomes U+FFFD, control
+/// chars become spaces. `n` counts chars written so far; stops at `max`.
+/// Never allocates.
+fn push_clean(out: &mut impl std::fmt::Write, n: &mut usize, bytes: &[u8], max: usize) {
+    for chunk in bytes.utf8_chunks() {
+        let bad = (!chunk.invalid().is_empty()).then_some('\u{FFFD}');
+        for ch in chunk.valid().chars().chain(bad) {
+            if *n >= max {
+                return;
+            }
+            let _ = out.write_char(if ch.is_control() { ' ' } else { ch });
+            *n += 1;
         }
-        out.push(if ch.is_control() { ' ' } else { ch });
-        n += 1;
     }
 }
 
@@ -108,7 +111,7 @@ pub fn user_name(uid: u32, out: &mut String) {
         let name = unsafe { (*pw).pw_name };
         if !name.is_null() {
             let s = unsafe { std::ffi::CStr::from_ptr(name) };
-            push_clean(out, s.to_bytes(), 10);
+            push_clean(out, &mut 0, s.to_bytes(), 10);
             return;
         }
     }
@@ -122,6 +125,10 @@ const PROC_FLAG_CONTROLT: u32 = 0x2;
 const CTL_KERN: c_int = 1;
 const KERN_ARGMAX: c_int = 8;
 const KERN_PROCARGS2: c_int = 49;
+const PROT_READ: c_int = 1;
+const PROT_WRITE: c_int = 2;
+const MAP_PRIVATE: c_int = 0x2;
+const MAP_ANON: c_int = 0x1000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -198,6 +205,8 @@ unsafe extern "C" {
     fn proc_pidpath(pid: c_int, buf: *mut c_void, size: u32) -> c_int;
     fn mach_timebase_info(info: *mut TimebaseInfo) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+    fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn sysctlbyname(
         name: *const std::ffi::c_char,
         oldp: *mut c_void,
@@ -304,42 +313,40 @@ fn arg_max() -> usize {
     if rc == 0 && val > 0 { val as usize } else { 256 * 1024 }
 }
 
-/// Writes the full command line (argv joined by spaces) into `out`.
-/// `scratch` is reused across calls; untouched capacity never becomes resident.
-pub fn cmdline(pid: u32, scratch: &mut Vec<u8>, out: &mut String, max: usize) -> bool {
-    out.clear();
-    if scratch.capacity() == 0 {
-        scratch.reserve_exact(arg_max());
-    }
-    scratch.clear();
-    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid as c_int];
-    let mut len = scratch.capacity();
-    let rc = unsafe {
-        sysctl(mib.as_mut_ptr(), 3, scratch.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
-    };
-    if rc != 0 || len < 4 {
+/// Writes the command line (argv joined by spaces, at most `max` chars)
+/// into `out`. The kernel buffer is a fresh anonymous mapping returned to
+/// the OS right after, so nothing stays resident between calls.
+pub fn cmdline(pid: u32, out: &mut impl std::fmt::Write, max: usize) -> bool {
+    let size = arg_max();
+    let map = unsafe { mmap(std::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0) };
+    if map as isize == -1 {
         return false;
     }
-    unsafe { scratch.set_len(len.min(scratch.capacity())) };
-
-    // Layout: argc (i32) | exec_path \0 | \0 padding | argv[0] \0 ... argv[argc-1] \0 | env...
-    let argc = i32::from_ne_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]).max(0) as usize;
-    let mut rest = &scratch[4..];
-    let skip = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
-    rest = &rest[skip..];
-    let skip = rest.iter().position(|&c| c != 0).unwrap_or(rest.len());
-    rest = &rest[skip..];
-
-    for (i, arg) in rest.split(|&c| c == 0).take(argc).enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        push_clean(out, arg, max);
-        if out.len() >= max {
-            break;
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid as c_int];
+    let mut len = size;
+    let rc = unsafe { sysctl(mib.as_mut_ptr(), 3, map, &mut len, std::ptr::null_mut(), 0) };
+    let mut n = 0;
+    if rc == 0 && len >= 4 {
+        let data = unsafe { std::slice::from_raw_parts(map.cast::<u8>(), len.min(size)) };
+        // Layout: argc (i32) | exec_path \0 | \0 padding | argv[0] \0 ... argv[argc-1] \0 | env...
+        let argc = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]).max(0) as usize;
+        let mut rest = &data[4..];
+        let skip = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
+        rest = &rest[skip..];
+        let skip = rest.iter().position(|&c| c != 0).unwrap_or(rest.len());
+        rest = &rest[skip..];
+        for (i, arg) in rest.split(|&c| c == 0).take(argc).enumerate() {
+            if i > 0 {
+                push_clean(out, &mut n, b" ", max);
+            }
+            push_clean(out, &mut n, arg, max);
+            if n >= max {
+                break;
+            }
         }
     }
-    !out.is_empty()
+    unsafe { munmap(map, size) };
+    n > 0
 }
 
 /// (start time, uid) of a live pid, used to make sure a pid was not reused
