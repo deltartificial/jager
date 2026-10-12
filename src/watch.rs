@@ -6,11 +6,12 @@
 //! memory threshold for `sustain` in a row.
 
 use crate::proc::{self, PATH_MAX, Proc, SIGKILL, SIGTERM, State};
-use crate::util::{fmt_bytes, fmt_dur, now_ms, parse_dur};
-use std::collections::HashMap;
+use crate::util::{Bytes, Dur, StackBuf, now_ms, parse_dur};
+use std::ffi::{c_char, c_void};
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::mem::size_of;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const HELP: &str = "\
@@ -85,24 +86,44 @@ pub struct Action {
     pub hot_ms: u64,
 }
 
+const SEEN: u8 = 1;
+const TERM_SENT: u8 = 2;
+/// Already acted upon in this hot episode.
+const DONE: u8 = 4;
+const HOT: u8 = 8;
+
+/// One tracked process: 32 bytes. Times are the low 32 bits of the
+/// millisecond clock; only short spans (< 49 days) are ever subtracted,
+/// so wrapping arithmetic is exact.
 #[derive(Clone, Copy)]
 struct Track {
-    start: u64,
+    pid: u32,
+    start: u32,
     last_cpu: u64,
-    last_ms: u64,
-    hot_since: Option<u64>,
-    term_at: Option<u64>,
-    /// Already acted upon in this hot episode.
-    done: bool,
-    seen: bool,
+    hot_since: u32,
+    term_at: u32,
+    flags: u8,
+}
+
+const _: () = assert!(size_of::<Track>() == 32);
+
+impl Track {
+    fn new(p: &Proc) -> Self {
+        Track { pid: p.pid, start: p.start as u32, last_cpu: p.cpu_ns, hot_since: 0, term_at: 0, flags: SEEN }
+    }
 }
 
 /// Pure decision engine: feed it process snapshots with a clock, it returns
 /// actions. No syscalls, so it is fully testable with fake time.
+///
+/// Tracks live in one Vec sorted by pid, allocated once: no hashing, no
+/// per-tick allocation. Every live track is refreshed on every tick, so a
+/// single engine-wide `dt` replaces per-track timestamps.
 pub struct Engine {
     pub policy: Policy,
-    tracks: HashMap<u32, Track>,
+    tracks: Vec<Track>,
     now: u64,
+    dt: u64,
     last_tick: Option<u64>,
     /// Set after a long gap (machine asleep): CPU deltas are meaningless.
     rebase: bool,
@@ -110,7 +131,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(policy: Policy) -> Self {
-        Engine { policy, tracks: HashMap::new(), now: 0, last_tick: None, rebase: false }
+        Engine { policy, tracks: Vec::with_capacity(1024), now: 0, dt: 0, last_tick: None, rebase: false }
     }
 
     pub fn tracked(&self) -> usize {
@@ -119,10 +140,8 @@ impl Engine {
 
     pub fn begin_tick(&mut self, now_ms: u64) {
         self.now = now_ms;
-        self.rebase = matches!(self.last_tick, Some(t) if now_ms.saturating_sub(t) > 3 * self.policy.interval_ms.max(1));
-        for t in self.tracks.values_mut() {
-            t.seen = false;
-        }
+        self.dt = self.last_tick.map_or(0, |t| now_ms.saturating_sub(t));
+        self.rebase = self.last_tick.is_some() && self.dt > 3 * self.policy.interval_ms.max(1);
     }
 
     /// `age_s` is supplied by the caller so time can be warped in tests.
@@ -133,88 +152,75 @@ impl Engine {
         mut protected: impl FnMut(&Proc) -> bool,
         out: &mut Vec<Action>,
     ) {
-        let now = self.now;
+        let idx = match self.tracks.binary_search_by_key(&p.pid, |t| t.pid) {
+            Ok(i) if self.tracks[i].start == p.start as u32 => i,
+            // Same pid, different process: start over.
+            Ok(i) => return self.tracks[i] = Track::new(p),
+            Err(i) => return self.tracks.insert(i, Track::new(p)),
+        };
         let pol = &self.policy;
-        // New pid, or pid reused by a different process.
-        if self.tracks.get(&p.pid).is_none_or(|t| t.start != p.start) {
-            self.tracks.insert(
-                    p.pid,
-                Track {
-                    start: p.start,
-                    last_cpu: p.cpu_ns,
-                    last_ms: now,
-                    hot_since: None,
-                    term_at: None,
-                    done: false,
-                    seen: true,
-                },
-            );
-            return;
-        }
-        let Some(t) = self.tracks.get_mut(&p.pid) else { return };
-        t.seen = true;
-        let prev_ms = t.last_ms;
-        let dt = now.saturating_sub(prev_ms);
+        let (now, dt) = (self.now, self.dt);
+        let now32 = now as u32;
+        let t = &mut self.tracks[idx];
+        t.flags |= SEEN;
         if dt == 0 {
             return;
         }
         let cpu_pct = (p.cpu_ns.saturating_sub(t.last_cpu) as f64 / (dt as f64 * 1e6) * 100.0) as f32;
         t.last_cpu = p.cpu_ns;
-        t.last_ms = now;
 
-        let act = |act, hot_ms| Action {
-            pid: p.pid,
-            start: p.start,
-            act,
-            cpu_pct,
-            rss: p.rss,
-            age_s,
-            hot_ms,
-        };
+        let act = |act, hot_ms| Action { pid: p.pid, start: p.start, act, cpu_pct, rss: p.rss, age_s, hot_ms };
 
         // Escalation runs regardless of current load.
-        if let Some(at) = t.term_at {
-            if !t.done && now.saturating_sub(at) >= pol.grace_ms {
+        if t.flags & TERM_SENT != 0 {
+            if t.flags & DONE == 0 && now32.wrapping_sub(t.term_at) as u64 >= pol.grace_ms {
                 out.push(act(Act::Kill, 0));
-                t.done = true;
+                t.flags |= DONE;
             }
             return;
         }
         if self.rebase {
-            t.hot_since = None;
+            t.flags &= !HOT;
             return;
         }
 
         let over = cpu_pct >= pol.cpu_pct || (pol.mem_bytes > 0 && p.rss >= pol.mem_bytes);
         let hot = over && age_s >= pol.min_age_s && !matches!(p.state, State::Zombie | State::Stop);
         if !hot {
-            t.hot_since = None;
-            t.done = false;
+            t.flags &= !(HOT | DONE);
             return;
         }
-        if t.done {
+        if t.flags & DONE != 0 {
             return;
         }
-        // It was already over threshold during the window that just ended.
-        let since = *t.hot_since.get_or_insert(prev_ms);
-        let hot_ms = now - since;
+        if t.flags & HOT == 0 {
+            // It was already over threshold during the window that just ended.
+            t.flags |= HOT;
+            t.hot_since = (now - dt) as u32;
+        }
+        let hot_ms = now32.wrapping_sub(t.hot_since) as u64;
         if hot_ms < pol.sustain_ms {
             return;
         }
         if protected(p) {
             out.push(act(Act::Spare, hot_ms));
-            t.done = true;
+            t.flags |= DONE;
         } else if pol.dry_run {
             out.push(act(Act::WouldKill, hot_ms));
-            t.done = true;
+            t.flags |= DONE;
         } else {
             out.push(act(Act::Term, hot_ms));
-            t.term_at = Some(now);
+            t.flags |= TERM_SENT;
+            t.term_at = now32;
         }
     }
 
     pub fn end_tick(&mut self) {
-        self.tracks.retain(|_, t| t.seen);
+        self.tracks.retain_mut(|t| {
+            let seen = t.flags & SEEN != 0;
+            t.flags &= !SEEN;
+            seen
+        });
         self.last_tick = Some(self.now);
         self.rebase = false;
     }
