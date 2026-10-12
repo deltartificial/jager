@@ -24,6 +24,13 @@ Run `jager <COMMAND> --help` for options.
 ";
 
 fn main() {
+    // Behave like a normal Unix tool when piped into `head`: die on SIGPIPE
+    // instead of panicking on the failed write.
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    unsafe { signal(13, 0) };
+
     let mut args = std::env::args().skip(1).peekable();
     let cmd = match args.peek().map(String::as_str) {
         Some("scan" | "watch" | "install" | "uninstall" | "status" | "bench") => args.next(),
