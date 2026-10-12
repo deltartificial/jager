@@ -220,3 +220,64 @@ fn task_all_info(pid: u32) -> Option<ProcTaskAllInfo> {
     };
     (n == size).then(|| unsafe { info.assume_init() })
 }
+
+/// Calls `f` for every readable process. Returns how many were unreadable
+/// (typically other users' processes when not root).
+pub fn scan(mut f: impl FnMut(Proc)) -> usize {
+    let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return 0;
+    }
+    let mut pids: Vec<i32> = vec![0; count as usize + 64];
+    let bytes = (pids.len() * size_of::<i32>()) as c_int;
+    let n = unsafe { proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(n.max(0) as usize);
+
+    let (numer, denom) = timebase();
+    let mut unreadable = 0;
+    for &pid in &pids {
+        if pid <= 0 {
+            continue;
+        }
+        let Some(ti) = task_all_info(pid as u32) else {
+            unreadable += 1;
+            continue;
+        };
+        let b = &ti.pbsd;
+        let t = &ti.ptinfo;
+        let mut p = blank();
+        p.pid = b.pbi_pid;
+        p.ppid = b.pbi_ppid;
+        p.uid = b.pbi_uid;
+        p.start = b.pbi_start_tvsec;
+        p.cpu_ns = ((t.pti_total_user + t.pti_total_system) as u128 * numer as u128
+            / denom as u128) as u64;
+        p.rss = t.pti_resident_size;
+        p.state = match b.pbi_status {
+            2 => {
+                if t.pti_numrunning > 0 { State::Run } else { State::Sleep }
+            }
+            3 => State::Sleep,
+            4 => State::Stop,
+            5 => State::Zombie,
+            _ => State::Other,
+        };
+        p.tty = b.pbi_flags & PROC_FLAG_CONTROLT != 0 && b.e_tdev != u32::MAX;
+        if b.pbi_name[0] != 0 {
+            p.set_name(&b.pbi_name);
+        } else {
+            p.set_name(&b.pbi_comm);
+        }
+        f(p);
+    }
+    unreadable
+}
+
+/// Fresh total CPU time for one pid, in ns.
+pub fn cpu_ns(pid: u32) -> Option<u64> {
+    let (numer, denom) = timebase();
+    task_all_info(pid).map(|ti| {
+        let t = ti.ptinfo;
+        ((t.pti_total_user + t.pti_total_system) as u128 * numer as u128 / denom as u128) as u64
+    })
+}
