@@ -34,7 +34,10 @@ fn main() {
         _ => None,
     };
     let res = match cmd.as_deref() {
-        Some("watch") => Ok(watch::run(args)),
+        Some("watch") => {
+            lean_malloc();
+            Ok(watch::run(args))
+        }
         Some("install") => launchd::install(args.collect()),
         Some("uninstall") => launchd::uninstall(),
         Some("status") => Ok(launchd::status()),
@@ -45,4 +48,21 @@ fn main() {
         eprintln!("jager: {e}");
         std::process::exit(1);
     }
+}
+
+/// The nano malloc zone keeps ~200-400 KB of dirty pages around, even for a
+/// C program that never allocates. It can only be turned off before libmalloc
+/// initializes, i.e. through the environment, so the daemon re-execs itself
+/// once with it disabled. The LaunchAgent sets the variable directly.
+fn lean_malloc() {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("MallocNanoZone").is_some_and(|v| v == "0") {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    // exec only returns on failure; then just run with the default allocator.
+    let _ = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("MallocNanoZone", "0")
+        .exec();
 }
