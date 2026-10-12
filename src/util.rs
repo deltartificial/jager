@@ -117,3 +117,25 @@ pub fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stack_buf_truncates_on_char_boundary() {
+        let mut b = StackBuf::<5>::new();
+        assert!(write!(b, "abcé!").is_err());
+        assert_eq!(b.as_str(), "abcé");
+        let mut b = StackBuf::<4>::new();
+        let _ = write!(b, "abcé");
+        assert_eq!(b.as_str(), "abc");
+    }
+
+    #[test]
+    fn formats_pad() {
+        assert_eq!(format!("{:>7}", Dur(5 * 3600 + 120)), "  5h02m");
+        assert_eq!(format!("{:>6}", Bytes(3 << 30)), "  3.0G");
+        assert_eq!(format!("{}", Dur(86_400 * 2 + 3600)), "2d01h");
+    }
+}
