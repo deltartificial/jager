@@ -140,7 +140,59 @@ pub fn status() {
         println!("\nlast events ({}):", log.display());
         let lines: Vec<&str> = text.lines().collect();
         for l in &lines[lines.len().saturating_sub(10)..] {
-            println!("  {l}");
+            match l.split_at_checked(20).and_then(|(ts, rest)| Some((utc_to_local(ts)?, rest))) {
+                Some((local, rest)) => println!("  {local}{rest}"),
+                None => println!("  {l}"),
+            }
         }
     }
+}
+
+#[repr(C)]
+struct Tm {
+    sec: i32,
+    min: i32,
+    hour: i32,
+    mday: i32,
+    mon: i32,
+    year: i32,
+    wday: i32,
+    yday: i32,
+    isdst: i32,
+    gmtoff: i64,
+    zone: *const std::ffi::c_char,
+}
+
+unsafe extern "C" {
+    fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+}
+
+/// "2026-10-12 21:42:58Z" (as written by the daemon) → local "2026-10-12 23:42:58".
+fn utc_to_local(ts: &str) -> Option<String> {
+    let ts = ts.strip_suffix('Z')?;
+    let num = |r: std::ops::Range<usize>| ts.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // Howard Hinnant's days_from_civil.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let t = (era * 146_097 + doe - 719_468) * 86_400 + hh * 3600 + mm * 60 + ss;
+
+    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+    if unsafe { localtime_r(&t, tm.as_mut_ptr()) }.is_null() {
+        return None;
+    }
+    let tm = unsafe { tm.assume_init() };
+    Some(format!(
+        "{}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.year + 1900,
+        tm.mon + 1,
+        tm.mday,
+        tm.hour,
+        tm.min,
+        tm.sec
+    ))
 }
