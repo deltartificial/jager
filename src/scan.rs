@@ -162,7 +162,6 @@ fn render(opts: &Opts, hits: &[Hit], total: usize, unreadable: usize) -> io::Res
 
     let mut user = String::new();
     let mut cmd = String::new();
-    let mut scratch = Vec::new();
     let max_cmd = if opts.wide { 4096 } else { 80 };
 
     write!(out, "{bold}{:>6}  {:>7}  {:>8}  {:>5}  {:>5}  {:>6}  S T  {:<7}  ", "PID", "AGE", "CPU", "AVG%", "NOW%", "RSS", "VERDICT")?;
@@ -203,15 +202,12 @@ fn render(opts: &Opts, hits: &[Hit], total: usize, unreadable: usize) -> io::Res
             proc::user_name(p.uid, &mut user);
             write!(out, "{user:<10}  ")?;
         }
-        if !proc::cmdline(p.pid, &mut scratch, &mut cmd, max_cmd) {
+        cmd.clear();
+        if !proc::cmdline(p.pid, &mut cmd, max_cmd) {
             cmd.clear();
             cmd.push_str(p.name());
         }
         writeln!(out, "{cmd}")?;
-        if opts.wide && scratch.capacity() > 64 * 1024 {
-            // Don't keep a 1 MiB argv buffer around between rows.
-            scratch = Vec::new();
-        }
     }
 
     let count = |v: Verdict| hits.iter().filter(|h| h.verdict == v).count();
