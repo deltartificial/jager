@@ -6,3 +6,12 @@ description = "Hunts macOS processes that have been running for too long"
 
 # Zero dependencies: direct FFI into libSystem.
 [dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
