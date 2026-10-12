@@ -59,6 +59,11 @@ pub fn install(args: Vec<String>) -> Result<(), String> {
   <key>ProgramArguments</key>
   <array>
 {argv}  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MallocNanoZone</key>
+    <string>0</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
