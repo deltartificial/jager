@@ -281,3 +281,51 @@ pub fn cpu_ns(pid: u32) -> Option<u64> {
         ((t.pti_total_user + t.pti_total_system) as u128 * numer as u128 / denom as u128) as u64
     })
 }
+
+fn arg_max() -> usize {
+    let mut mib = [CTL_KERN, KERN_ARGMAX];
+    let mut val: c_int = 0;
+    let mut len = size_of::<c_int>();
+    let rc = unsafe {
+        sysctl(mib.as_mut_ptr(), 2, (&mut val as *mut c_int).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc == 0 && val > 0 { val as usize } else { 256 * 1024 }
+}
+
+/// Writes the full command line (argv joined by spaces) into `out`.
+/// `scratch` is reused across calls; untouched capacity never becomes resident.
+pub fn cmdline(pid: u32, scratch: &mut Vec<u8>, out: &mut String, max: usize) -> bool {
+    out.clear();
+    if scratch.capacity() == 0 {
+        scratch.reserve_exact(arg_max());
+    }
+    scratch.clear();
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid as c_int];
+    let mut len = scratch.capacity();
+    let rc = unsafe {
+        sysctl(mib.as_mut_ptr(), 3, scratch.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc != 0 || len < 4 {
+        return false;
+    }
+    unsafe { scratch.set_len(len.min(scratch.capacity())) };
+
+    // Layout: argc (i32) | exec_path \0 | \0 padding | argv[0] \0 ... argv[argc-1] \0 | env...
+    let argc = i32::from_ne_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]).max(0) as usize;
+    let mut rest = &scratch[4..];
+    let skip = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
+    rest = &rest[skip..];
+    let skip = rest.iter().position(|&c| c != 0).unwrap_or(rest.len());
+    rest = &rest[skip..];
+
+    for (i, arg) in rest.split(|&c| c == 0).take(argc).enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        push_clean(out, arg, max);
+        if out.len() >= max {
+            break;
+        }
+    }
+    !out.is_empty()
+}
