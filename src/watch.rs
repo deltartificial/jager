@@ -347,29 +347,23 @@ pub fn run(args: impl Iterator<Item = String>) {
     };
     let me = proc::my_uid();
     let self_pid = std::process::id();
-    let mut log = Log::new(o.log.clone());
+    let log = Log { path: o.log.as_deref() };
 
     let pol = &o.policy;
-    let mut line = String::new();
-    let mut a = String::new();
-    let mut b = String::new();
-    let mut c = String::new();
-    fmt_dur(&mut a, pol.min_age_s);
-    fmt_dur(&mut b, pol.sustain_ms / 1000);
-    fmt_bytes(&mut c, pol.mem_bytes);
-    let _ = write!(
-        line,
-        "START pid={self_pid} min-age={a} cpu>={}% mem>={} sustain={b} interval={}ms grace={}ms{}",
+    let mem = Bytes(pol.mem_bytes);
+    log.write(format_args!(
+        "START pid={self_pid} min-age={} cpu>={}% mem>={} sustain={} interval={}ms grace={}ms{}",
+        Dur(pol.min_age_s),
         pol.cpu_pct,
-        if pol.mem_bytes == 0 { "off" } else { &c },
+        if pol.mem_bytes == 0 { &"off" as &dyn std::fmt::Display } else { &mem },
+        Dur(pol.sustain_ms / 1000),
         pol.interval_ms,
         pol.grace_ms,
         if pol.dry_run { " DRY-RUN" } else { "" },
-    );
-    log.write(&line);
+    ));
 
     let mut engine = Engine::new(o.policy);
-    let mut actions: Vec<Action> = Vec::with_capacity(4);
+    let mut actions: Vec<Action> = Vec::with_capacity(16);
     let mut path_buf = [0u8; PATH_MAX];
     let mut tick = 0u64;
     loop {
@@ -389,7 +383,7 @@ pub fn run(args: impl Iterator<Item = String>) {
         engine.end_tick();
 
         for act in actions.drain(..) {
-            execute(&act, me, &o, &mut log);
+            execute(&act, me, &o, &log);
         }
 
         tick += 1;
@@ -400,19 +394,15 @@ pub fn run(args: impl Iterator<Item = String>) {
     }
 }
 
-fn execute(a: &Action, me: u32, o: &Opts, log: &mut Log) {
-    let mut line = String::new();
-    let mut cmd = String::new();
-    let mut scratch = Vec::new();
-    if !proc::cmdline(a.pid, &mut scratch, &mut cmd, 200) {
-        cmd.push('?');
+fn execute(a: &Action, me: u32, o: &Opts, log: &Log) {
+    let mut cmd = StackBuf::<240>::new();
+    if !proc::cmdline(a.pid, &mut cmd, 200) {
+        let _ = cmd.write_char('?');
     }
-    drop(scratch);
 
     // Never signal a pid that now belongs to someone else.
     if proc::identity(a.pid) != Some((a.start, me)) {
-        let _ = write!(line, "GONE pid={} (exited or reused before {:?})", a.pid, a.act);
-        log.write(&line);
+        log.write(format_args!("GONE pid={} (exited or reused before {:?})", a.pid, a.act));
         return;
     }
 
@@ -422,100 +412,136 @@ fn execute(a: &Action, me: u32, o: &Opts, log: &mut Log) {
         Act::WouldKill => ("WOULD-KILL", true),
         Act::Spare => ("SPARED", true),
     };
-    let (mut age, mut hot, mut rss) = (String::new(), String::new(), String::new());
-    fmt_dur(&mut age, a.age_s);
-    fmt_dur(&mut hot, a.hot_ms / 1000);
-    fmt_bytes(&mut rss, a.rss);
-    let _ = write!(
-        line,
-        "{tag}{} pid={} age={age} cpu={:.0}% rss={rss} hot-for={hot} cmd={cmd}",
+    log.write(format_args!(
+        "{tag}{} pid={} age={} cpu={:.0}% rss={} hot-for={} cmd={}",
         if ok { "" } else { "(failed)" },
         a.pid,
+        Dur(a.age_s),
         a.cpu_pct,
-    );
-    log.write(&line);
+        Bytes(a.rss),
+        Dur(a.hot_ms / 1000),
+        cmd.as_str(),
+    ));
 
     if o.notify && matches!(a.act, Act::Term | Act::WouldKill) {
-        let verb = if a.act == Act::Term { "Killed" } else { "Would kill" };
-        let short: String = cmd.chars().take(60).collect();
-        let msg = format!("{verb} pid {} ({:.0}% CPU, {rss}, up {age}): {short}", a.pid, a.cpu_pct);
-        notify(&msg);
+        let mut msg = StackBuf::<160>::new();
+        let short: &str = {
+            let s = cmd.as_str();
+            s.char_indices().nth(60).map_or(s, |(i, _)| &s[..i])
+        };
+        let _ = write!(
+            msg,
+            "{} pid {} ({:.0}% CPU, {}, up {}): {short}",
+            if a.act == Act::Term { "Killed" } else { "Would kill" },
+            a.pid,
+            a.cpu_pct,
+            Bytes(a.rss),
+            Dur(a.age_s),
+        );
+        notify(msg.as_str());
     }
 }
 
+unsafe extern "C" {
+    fn posix_spawn(
+        pid: *mut i32,
+        path: *const c_char,
+        file_actions: *const *mut c_void,
+        attr: *const c_void,
+        argv: *const *const c_char,
+        envp: *const *const c_char,
+    ) -> i32;
+    fn posix_spawn_file_actions_init(fa: *mut *mut c_void) -> i32;
+    fn posix_spawn_file_actions_addopen(
+        fa: *mut *mut c_void,
+        fd: i32,
+        path: *const c_char,
+        oflag: i32,
+        mode: u16,
+    ) -> i32;
+    fn posix_spawn_file_actions_destroy(fa: *mut *mut c_void) -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}
+
+/// macOS notification through osascript, spawned directly with an empty
+/// environment (std's Command would copy the whole environment).
 fn notify(msg: &str) {
-    let esc = msg.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("display notification \"{esc}\" with title \"jäger\"");
-    let _ = std::process::Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-/// Append-only log with 1 MiB rotation. The file is opened per write:
-/// events are rare and an idle daemon holds no descriptor.
-pub struct Log {
-    path: Option<PathBuf>,
-}
-
-impl Log {
-    pub fn new(path: Option<PathBuf>) -> Self {
-        Log { path }
+    let mut script = StackBuf::<400>::new();
+    let _ = script.write_str("display notification \"");
+    for ch in msg.chars() {
+        if matches!(ch, '"' | '\\') {
+            let _ = script.write_char('\\');
+        }
+        let _ = script.write_char(ch);
     }
+    if script.write_str("\" with title \"jäger\"\0").is_err() {
+        return;
+    }
+    let argv = [c"osascript".as_ptr(), c"-e".as_ptr(), script.as_bytes().as_ptr().cast(), std::ptr::null()];
+    let envp = [std::ptr::null::<c_char>()];
+    unsafe {
+        let mut fa: *mut c_void = std::ptr::null_mut();
+        posix_spawn_file_actions_init(&mut fa);
+        posix_spawn_file_actions_addopen(&mut fa, 1, c"/dev/null".as_ptr(), 1, 0);
+        posix_spawn_file_actions_addopen(&mut fa, 2, c"/dev/null".as_ptr(), 1, 0);
+        let mut pid = 0;
+        let rc = posix_spawn(&mut pid, c"/usr/bin/osascript".as_ptr(), &fa, std::ptr::null(), argv.as_ptr(), envp.as_ptr());
+        posix_spawn_file_actions_destroy(&mut fa);
+        if rc == 0 {
+            let mut st = 0;
+            waitpid(pid, &mut st, 0);
+        }
+    }
+}
 
-    pub fn write(&mut self, msg: &str) {
-        let mut ts = String::new();
-        timestamp(&mut ts);
-        let Some(path) = &self.path else {
-            eprintln!("{ts} {msg}");
+/// Append-only log with 1 MiB rotation. Lines are formatted on the stack
+/// and the file is opened per write: events are rare and an idle daemon
+/// holds no descriptor and no buffer.
+pub struct Log<'a> {
+    path: Option<&'a Path>,
+}
+
+impl Log<'_> {
+    pub fn write(&self, msg: std::fmt::Arguments) {
+        let mut line = StackBuf::<512>::new();
+        timestamp(&mut line);
+        let _ = write!(line, " {msg}");
+        let _ = line.write_char('\n');
+        let Some(path) = self.path else {
+            let _ = std::io::stderr().write_all(line.as_bytes());
             return;
         };
         if std::fs::metadata(path).is_ok_and(|m| m.len() > 1 << 20) {
             let _ = std::fs::rename(path, path.with_extension("log.1"));
         }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{ts} {msg}");
+            let _ = f.write_all(line.as_bytes());
         }
     }
 }
 
-#[repr(C)]
-struct Tm {
-    sec: i32,
-    min: i32,
-    hour: i32,
-    mday: i32,
-    mon: i32,
-    year: i32,
-    wday: i32,
-    yday: i32,
-    isdst: i32,
-    gmtoff: i64,
-    zone: *const std::ffi::c_char,
-}
-
-unsafe extern "C" {
-    fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
-}
-
-fn timestamp(out: &mut String) {
-    let t = (now_ms() / 1000) as i64;
-    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
-    if unsafe { localtime_r(&t, tm.as_mut_ptr()) }.is_null() {
-        let _ = write!(out, "@{t}");
-        return;
-    }
-    let tm = unsafe { tm.assume_init() };
+/// UTC timestamp, e.g. "2026-10-12 21:42:58Z". Local time would make libc
+/// load the timezone database (~80 KB, resident forever); `jager status`
+/// converts to local time when displaying.
+fn timestamp(out: &mut impl std::fmt::Write) {
+    let t = now_ms() / 1000;
+    let (secs, days) = (t % 86_400, (t / 86_400) as i64);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
     let _ = write!(
         out,
-        "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-        tm.year + 1900,
-        tm.mon + 1,
-        tm.mday,
-        tm.hour,
-        tm.min,
-        tm.sec
+        "{y}-{m:02}-{d:02} {:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
     );
 }
 
