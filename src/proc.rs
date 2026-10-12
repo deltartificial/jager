@@ -362,3 +362,25 @@ pub const SIGTERM: i32 = 15;
 pub fn signal(pid: u32, sig: i32) -> bool {
     pid > 1 && unsafe { kill(pid as c_int, sig) } == 0
 }
+
+/// Installed physical memory, bytes.
+pub fn phys_mem() -> u64 {
+    let mut val: u64 = 0;
+    let mut len = size_of::<u64>();
+    let rc = unsafe {
+        sysctlbyname(c"hw.memsize".as_ptr(), (&mut val as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc == 0 { val } else { 0 }
+}
+
+/// (resident bytes, total CPU ns) of the current process.
+pub fn self_usage() -> (u64, u64) {
+    let (numer, denom) = timebase();
+    task_all_info(std::process::id())
+        .map(|ti| {
+            let t = ti.ptinfo;
+            let cpu = (t.pti_total_user + t.pti_total_system) as u128 * numer as u128 / denom as u128;
+            (t.pti_resident_size, cpu as u64)
+        })
+        .unwrap_or((0, 0))
+}
