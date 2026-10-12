@@ -1,3 +1,5 @@
+![jäger](assets/banner.jpg)
+
 # jäger
 
 A resident macOS hunter for processes that have been running for too long: infinite loops, `node` servers that won't die, never-ending queries, memory hogs. It runs all the time, decides on its own, and kills them.
