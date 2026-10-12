@@ -512,3 +512,196 @@ fn timestamp(out: &mut String) {
         tm.sec
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const H: u64 = 3600;
+    const MIN: u64 = 60_000;
+
+    fn policy() -> Policy {
+        Policy {
+            min_age_s: 3 * H,
+            cpu_pct: 80.0,
+            mem_bytes: 16 << 30,
+            sustain_ms: 10 * MIN,
+            grace_ms: 15_000,
+            interval_ms: 30_000,
+            dry_run: false,
+        }
+    }
+
+    fn proc_(pid: u32, start: u64) -> Proc {
+        let mut p = proc::blank();
+        p.pid = pid;
+        p.start = start;
+        p.state = State::Run;
+        p
+    }
+
+    /// Drives one process through ticks every 30s at the given CPU load.
+    /// Returns every action emitted with the tick time.
+    struct Sim {
+        e: Engine,
+        p: Proc,
+        now: u64,
+        out: Vec<(u64, Action)>,
+    }
+
+    impl Sim {
+        fn new(pol: Policy, age_s: u64) -> Self {
+            let now = 1_000_000 * 1000;
+            Sim { e: Engine::new(pol), p: proc_(42, now / 1000 - age_s), now, out: Vec::new() }
+        }
+
+        fn run(&mut self, secs: u64, load_pct: f64, protected: bool) {
+            let steps = secs / 30;
+            for _ in 0..steps {
+                self.now += 30_000;
+                self.p.cpu_ns += (30e9 * load_pct / 100.0) as u64;
+                let mut acts = Vec::new();
+                self.e.begin_tick(self.now);
+                let age = self.now / 1000 - self.p.start;
+                self.e.observe(&self.p, age, |_| protected, &mut acts);
+                self.e.end_tick();
+                self.out.extend(acts.into_iter().map(|a| (self.now, a)));
+            }
+        }
+
+        fn acts(&self) -> Vec<Act> {
+            self.out.iter().map(|(_, a)| a.act).collect()
+        }
+    }
+
+    #[test]
+    fn spinning_for_hours_gets_term_then_kill() {
+        let mut s = Sim::new(policy(), 5 * H);
+        // First tick is only a baseline, so hot time starts on the second.
+        s.run(10 * 60, 100.0, false);
+        assert!(s.acts().is_empty(), "nothing before sustain elapsed");
+        s.run(30, 100.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+        assert_eq!(s.out[0].1.hot_ms, 10 * MIN);
+        s.run(30, 100.0, false);
+        assert_eq!(s.acts(), [Act::Term, Act::Kill]);
+        s.run(10 * 60, 100.0, false);
+        assert_eq!(s.acts(), [Act::Term, Act::Kill], "kill is sent once");
+    }
+
+    #[test]
+    fn young_process_is_left_alone() {
+        let mut s = Sim::new(policy(), 2 * H);
+        s.run(50 * 60, 100.0, false);
+        assert!(s.acts().is_empty());
+    }
+
+    #[test]
+    fn young_process_is_hunted_once_it_crosses_min_age() {
+        let mut s = Sim::new(policy(), 3 * H - 5 * 60);
+        s.run(5 * 60, 100.0, false);
+        s.run(10 * 60 - 60, 100.0, false);
+        assert!(s.acts().is_empty(), "sustain counts only after min-age");
+        s.run(30, 100.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+    }
+
+    #[test]
+    fn idle_old_process_is_left_alone() {
+        let mut s = Sim::new(policy(), 48 * H);
+        s.run(60 * 60, 2.0, false);
+        assert!(s.acts().is_empty());
+    }
+
+    #[test]
+    fn a_cool_down_resets_the_sustain_timer() {
+        let mut s = Sim::new(policy(), 5 * H);
+        s.run(9 * 60, 100.0, false);
+        s.run(30, 5.0, false);
+        s.run(9 * 60, 100.0, false);
+        assert!(s.acts().is_empty());
+        s.run(60, 100.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+    }
+
+    #[test]
+    fn memory_hog_is_hunted_even_when_idle() {
+        let mut s = Sim::new(policy(), 5 * H);
+        s.p.rss = 20 << 30;
+        s.run(11 * 60, 0.0, false);
+        assert_eq!(s.acts()[0], Act::Term);
+    }
+
+    #[test]
+    fn protected_is_spared_once() {
+        let mut s = Sim::new(policy(), 5 * H);
+        s.run(60 * 60, 100.0, true);
+        assert_eq!(s.acts(), [Act::Spare]);
+    }
+
+    #[test]
+    fn dry_run_never_kills_and_reports_once_per_episode() {
+        let mut s = Sim::new(Policy { dry_run: true, ..policy() }, 5 * H);
+        s.run(60 * 60, 100.0, false);
+        assert_eq!(s.acts(), [Act::WouldKill]);
+        s.run(30, 0.0, false);
+        s.run(11 * 60, 100.0, false);
+        assert_eq!(s.acts(), [Act::WouldKill, Act::WouldKill]);
+    }
+
+    #[test]
+    fn sleep_gap_does_not_count_as_hot_time() {
+        let mut s = Sim::new(policy(), 5 * H);
+        s.run(9 * 60, 100.0, false);
+        s.now += 2 * H * 1000; // lid closed for 2h
+        s.run(30, 100.0, false);
+        assert!(s.acts().is_empty(), "rebased after wake");
+        s.run(9 * 60, 100.0, false);
+        assert!(s.acts().is_empty());
+        s.run(60, 100.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+    }
+
+    #[test]
+    fn pid_reuse_starts_a_fresh_track() {
+        let mut s = Sim::new(policy(), 5 * H);
+        s.run(9 * 60, 100.0, false);
+        s.p.start += 1; // same pid, different process
+        s.run(9 * 60, 100.0, false);
+        assert!(s.acts().is_empty());
+    }
+
+    #[test]
+    fn stopped_and_zombie_are_not_hunted() {
+        for st in [State::Stop, State::Zombie] {
+            let mut s = Sim::new(policy(), 5 * H);
+            s.p.state = st;
+            s.p.rss = 20 << 30;
+            s.run(60 * 60, 100.0, false);
+            assert!(s.acts().is_empty());
+        }
+    }
+
+    #[test]
+    fn gone_processes_are_forgotten() {
+        let mut e = Engine::new(policy());
+        e.begin_tick(1000);
+        e.observe(&proc_(1, 0), 0, |_| false, &mut Vec::new());
+        e.observe(&proc_(2, 0), 0, |_| false, &mut Vec::new());
+        e.end_tick();
+        assert_eq!(e.tracked(), 2);
+        e.begin_tick(2000);
+        e.observe(&proc_(2, 0), 0, |_| false, &mut Vec::new());
+        e.end_tick();
+        assert_eq!(e.tracked(), 1);
+    }
+
+    #[test]
+    fn parses_mem() {
+        assert_eq!(parse_mem("8G").unwrap(), 8 << 30);
+        assert_eq!(parse_mem("512M").unwrap(), 512 << 20);
+        assert_eq!(parse_mem("0").unwrap(), 0);
+        assert!(parse_mem("50%").unwrap() > 0);
+        assert!(parse_mem("lots").is_err());
+    }
+}
