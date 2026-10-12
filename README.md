@@ -2,41 +2,60 @@
 
 # jäger
 
-Resident macOS daemon that kills long-running runaway processes.
+A resident macOS hunter for processes that have been running for too long: infinite loops, `node` servers that won't die, never-ending queries, memory hogs. It runs all the time, decides on its own, and kills them.
 
-- No dependencies, direct FFI to `libproc` / `sysctl`
-- 865 KB footprint, ~0.6 ms CPU per scan
+- Zero dependencies: direct FFI into `libproc` / `sysctl` (libSystem).
+- **865 KB** physical footprint, flat over time.
+- **~0.6 ms** CPU per scan of ~500 processes, ~70 ms of CPU per hour.
 
 ## Install
 
 ```sh
 cargo install --path .
-jager install            # LaunchAgent, starts at login
-jager install --dry-run  # log only, never kill
-jager status
+jager install                 # LaunchAgent: starts at login, restarted if it dies
+jager install --dry-run       # only logs/notifies what it would kill
+jager status                  # agent state, footprint, last events
 jager uninstall
 ```
 
-## Policy
+## Kill policy (`jager watch`)
 
-A process is killed if it is yours, older than 3h, and above 80% CPU or 25% RAM for 10 min. System paths and `/Applications` are skipped. SIGTERM, then SIGKILL after 15 s.
+A process is killed when **all** of these hold:
 
-```sh
-jager watch --min-age 3h --cpu 80 --mem 25% --sustain 10m --interval 30s --grace 15s --protect NAME
+1. it belongs to you (never root, never other users);
+2. it is older than `--min-age` (default **3h**);
+3. it has used ≥ `--cpu` of a core (default **80%**) or ≥ `--mem` of RSS (default **25% of RAM**) for `--sustain` in a row (default **10 min**, sampled every 30 s);
+4. it is not protected: system paths, GUI apps in `/Applications` (unless `--include-apps`), and anything matching `--protect NAME`.
+
+It gets `SIGTERM`, then `SIGKILL` after `--grace` (15 s). The pid's start time and owner are re-checked before each signal, so a recycled pid is never hit. Time spent asleep never counts as hot.
+
+Every decision goes to `~/Library/Logs/jager.log`, plus a macOS notification:
+
+```
+2026-10-12 21:29:50Z TERM pid=58058 age=5h00m cpu=100% rss=2M hot-for=10m00s cmd=/bin/sh -c ...
+2026-10-12 21:30:05Z KILL pid=58058 age=5h00m cpu=100% rss=2M hot-for=0s cmd=/bin/sh -c ...
 ```
 
-Log: `~/Library/Logs/jager.log`
-
-## Scan
+## One-shot report (`jager scan`)
 
 ```sh
-jager            # one-shot report
-jager -t 30m -c  # > 30 min, sorted by CPU
+jager                 # your processes > 1h that are hot, zombie, stopped, or attached to a terminal
+jager -t 30m -c       # > 30 min, sorted by CPU
+jager -a -u           # everything, all users (sudo to read other users' processes)
 ```
 
-## Test
+| Verdict  | Meaning                            |
+|----------|------------------------------------|
+| LOOP     | ≥ 90% of a core: likely a loop     |
+| HOT      | ≥ 20% of a core                    |
+| ZOMBIE   | dead, not reaped by its parent     |
+| STOPPED  | suspended (Ctrl-Z, SIGSTOP)        |
+| IDLE     | alive, resting (shown with `-a`)   |
+
+## Tests & benchmarks
 
 ```sh
-cargo test
-jager bench
+cargo test            # decision engine on a fake clock + real processes and real signals
+jager bench -n 500    # cost of one scan tick
+bench/soak.sh 300 1s  # whole-system dry-run, memory/CPU over time
 ```
