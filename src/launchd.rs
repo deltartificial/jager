@@ -196,3 +196,16 @@ fn utc_to_local(ts: &str) -> Option<String> {
         tm.sec
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn utc_to_local_round_trips_through_libc() {
+        let local = super::utc_to_local("2026-10-12 21:42:58Z").unwrap();
+        let out = std::process::Command::new("date")
+            .args(["-r", "1791841378", "+%Y-%m-%d %H:%M:%S"])
+            .output()
+            .unwrap();
+        assert_eq!(local, String::from_utf8(out.stdout).unwrap().trim());
+    }
+}
