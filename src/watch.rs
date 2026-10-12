@@ -729,6 +729,16 @@ mod tests {
     }
 
     #[test]
+    fn utc_timestamp_matches_libc() {
+        let mut b = StackBuf::<32>::new();
+        timestamp(&mut b);
+        let out = std::process::Command::new("date").args(["-u", "+%Y-%m-%d %H:%M"]).output().unwrap();
+        let want = String::from_utf8(out.stdout).unwrap();
+        assert!(b.as_str().starts_with(want.trim()), "{} vs {want}", b.as_str());
+        assert!(b.as_str().ends_with('Z'));
+    }
+
+    #[test]
     fn parses_mem() {
         assert_eq!(parse_mem("8G").unwrap(), 8 << 30);
         assert_eq!(parse_mem("512M").unwrap(), 512 << 20);
