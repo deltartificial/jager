@@ -57,7 +57,7 @@ impl Proc {
     }
 }
 
-fn blank() -> Proc {
+pub(crate) fn blank() -> Proc {
     Proc {
         pid: 0,
         ppid: 0,
@@ -194,7 +194,16 @@ struct TimebaseInfo {
 unsafe extern "C" {
     fn proc_listallpids(buf: *mut c_void, size: c_int) -> c_int;
     fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buf: *mut c_void, size: c_int) -> c_int;
+    fn proc_pidpath(pid: c_int, buf: *mut c_void, size: u32) -> c_int;
     fn mach_timebase_info(info: *mut TimebaseInfo) -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn sysctlbyname(
+        name: *const std::ffi::c_char,
+        oldp: *mut c_void,
+        oldlenp: *mut usize,
+        newp: *mut c_void,
+        newlen: usize,
+    ) -> c_int;
     fn sysctl(
         name: *mut c_int,
         namelen: c_uint,
@@ -328,4 +337,28 @@ pub fn cmdline(pid: u32, scratch: &mut Vec<u8>, out: &mut String, max: usize) ->
         }
     }
     !out.is_empty()
+}
+
+/// (start time, uid) of a live pid, used to make sure a pid was not reused
+/// before signalling it.
+pub fn identity(pid: u32) -> Option<(u64, u32)> {
+    task_all_info(pid).map(|ti| (ti.pbsd.pbi_start_tvsec, ti.pbsd.pbi_uid))
+}
+
+pub const PATH_MAX: usize = 4096;
+
+/// Executable path of `pid`, written into `buf`.
+pub fn path(pid: u32, buf: &mut [u8; PATH_MAX]) -> Option<&str> {
+    let n = unsafe { proc_pidpath(pid as c_int, buf.as_mut_ptr().cast(), PATH_MAX as u32) };
+    if n <= 0 {
+        return None;
+    }
+    std::str::from_utf8(&buf[..n as usize]).ok()
+}
+
+pub const SIGKILL: i32 = 9;
+pub const SIGTERM: i32 = 15;
+
+pub fn signal(pid: u32, sig: i32) -> bool {
+    pid > 1 && unsafe { kill(pid as c_int, sig) } == 0
 }
