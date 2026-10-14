@@ -2,7 +2,7 @@
 
 use crate::proc;
 use crate::util::{fmt_bytes, now_ms};
-use crate::watch::{Action, Engine, Policy, default_policy};
+use crate::watch::{Action, Engine, Policy, default_fast_policy, default_policy};
 use std::time::Instant;
 
 pub fn run(mut args: impl Iterator<Item = String>) {
@@ -20,7 +20,7 @@ pub fn run(mut args: impl Iterator<Item = String>) {
     let (rss0, cpu0) = proc::self_usage();
     let pol = Policy { dry_run: true, ..default_policy() };
     let interval_ms = pol.interval_ms;
-    let mut engine = Engine::new(pol);
+    let mut engine = Engine::new(pol, Policy { dry_run: true, ..default_fast_policy() });
     let mut actions: Vec<Action> = Vec::new();
     let me = proc::my_uid();
 
@@ -39,7 +39,7 @@ pub fn run(mut args: impl Iterator<Item = String>) {
                 return;
             }
             let age = (now / 1000).saturating_sub(p.start);
-            engine.observe(&p, age, |_| true, &mut actions);
+            engine.observe(&p, age, false, |_| true, &mut actions);
         });
         engine.end_tick();
         actions.clear();

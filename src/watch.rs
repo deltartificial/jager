@@ -4,6 +4,11 @@
 //! the last interval, and kills (SIGTERM, then SIGKILL after `grace`) any
 //! process that is older than `min_age` and has stayed above the CPU or
 //! memory threshold for `sustain` in a row.
+//!
+//! Headless browsers driven by agents (`agent-browser`, Chrome for Testing)
+//! go through a faster lane: shorter age and sustain, a lower memory bar,
+//! and a detached one (parent = launchd) that sits idle is taken as
+//! abandoned by the session that started it.
 
 use crate::proc::{self, PATH_MAX, Proc, SIGKILL, SIGTERM, State};
 use crate::util::{Bytes, Dur, StackBuf, now_ms, parse_dur};
@@ -26,6 +31,12 @@ A process is killed when ALL of these hold:
   - it is not protected (system paths, apps in /Applications, --protect)
 It first gets SIGTERM, then SIGKILL if still alive after --grace.
 
+Fast lane: processes whose name contains a --fast pattern (default:
+agent-browser, Chrome for Testing) use the --fast-* thresholds instead, and
+are also killed when detached (parent = launchd) and idle (< 1% CPU) for
+--fast-idle: an agent's browser left behind after its session ended.
+Killing the agent-browser daemon closes its whole Chrome.
+
 OPTIONS:
   --min-age DUR     minimum age before it can be hunted (default: 3h)
   --cpu PCT         CPU threshold, % of one core (default: 80)
@@ -36,6 +47,13 @@ OPTIONS:
   --protect NAME    never kill processes whose name or path contains NAME
                     (repeatable)
   --include-apps    also hunt apps from /Applications
+  --fast NAME       add a fast-lane name pattern (repeatable)
+  --no-fast         no fast lane
+  --fast-min-age DUR  (default: 10m)
+  --fast-sustain DUR  (default: 2m)
+  --fast-mem SIZE|PCT (default: 2G)
+  --fast-idle DUR   kill a detached fast-lane process idle this long,
+                    0 = off (default: 10m)
   --dry-run         log and notify, but never send a signal
   --no-notify       no macOS notifications
   --log PATH        log file (default: ~/Library/Logs/jager.log, - = stderr)
@@ -64,8 +82,13 @@ pub struct Policy {
     pub sustain_ms: u64,
     pub grace_ms: u64,
     pub interval_ms: u64,
+    /// Detached and idle this long = abandoned. 0 = rule off.
+    pub idle_ms: u64,
     pub dry_run: bool,
 }
+
+/// Below this, a tick counts as idle.
+const IDLE_CPU_PCT: f32 = 1.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Act {
@@ -83,7 +106,9 @@ pub struct Action {
     pub cpu_pct: f32,
     pub rss: u64,
     pub age_s: u64,
+    /// How long the condition held (hot, or idle when `idle`).
     pub hot_ms: u64,
+    pub idle: bool,
 }
 
 const SEEN: u8 = 1;
@@ -91,6 +116,7 @@ const TERM_SENT: u8 = 2;
 /// Already acted upon in this hot episode.
 const DONE: u8 = 4;
 const HOT: u8 = 8;
+const IDLE: u8 = 16;
 
 /// One tracked process: 32 bytes. Times are the low 32 bits of the
 /// millisecond clock; only short spans (< 49 days) are ever subtracted,
@@ -101,6 +127,7 @@ struct Track {
     start: u32,
     last_cpu: u64,
     hot_since: u32,
+    idle_since: u32,
     term_at: u32,
     flags: u8,
 }
@@ -109,7 +136,7 @@ const _: () = assert!(size_of::<Track>() == 32);
 
 impl Track {
     fn new(p: &Proc) -> Self {
-        Track { pid: p.pid, start: p.start as u32, last_cpu: p.cpu_ns, hot_since: 0, term_at: 0, flags: SEEN }
+        Track { pid: p.pid, start: p.start as u32, last_cpu: p.cpu_ns, hot_since: 0, idle_since: 0, term_at: 0, flags: SEEN }
     }
 }
 
@@ -121,6 +148,8 @@ impl Track {
 /// single engine-wide `dt` replaces per-track timestamps.
 pub struct Engine {
     pub policy: Policy,
+    /// Policy of the fast lane.
+    pub fast: Policy,
     tracks: Vec<Track>,
     now: u64,
     dt: u64,
@@ -130,8 +159,8 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(policy: Policy) -> Self {
-        Engine { policy, tracks: Vec::with_capacity(1024), now: 0, dt: 0, last_tick: None, rebase: false }
+    pub fn new(policy: Policy, fast: Policy) -> Self {
+        Engine { policy, fast, tracks: Vec::with_capacity(1024), now: 0, dt: 0, last_tick: None, rebase: false }
     }
 
     pub fn tracked(&self) -> usize {
@@ -145,10 +174,12 @@ impl Engine {
     }
 
     /// `age_s` is supplied by the caller so time can be warped in tests.
+    /// `fast` puts the process in the fast lane.
     pub fn observe(
         &mut self,
         p: &Proc,
         age_s: u64,
+        fast: bool,
         mut protected: impl FnMut(&Proc) -> bool,
         out: &mut Vec<Action>,
     ) {
@@ -158,7 +189,7 @@ impl Engine {
             Ok(i) => return self.tracks[i] = Track::new(p),
             Err(i) => return self.tracks.insert(i, Track::new(p)),
         };
-        let pol = &self.policy;
+        let pol = if fast { &self.fast } else { &self.policy };
         let (now, dt) = (self.now, self.dt);
         let now32 = now as u32;
         let t = &mut self.tracks[idx];
@@ -169,47 +200,63 @@ impl Engine {
         let cpu_pct = (p.cpu_ns.saturating_sub(t.last_cpu) as f64 / (dt as f64 * 1e6) * 100.0) as f32;
         t.last_cpu = p.cpu_ns;
 
-        let act = |act, hot_ms| Action { pid: p.pid, start: p.start, act, cpu_pct, rss: p.rss, age_s, hot_ms };
+        let act = |act, hot_ms, idle| Action { pid: p.pid, start: p.start, act, cpu_pct, rss: p.rss, age_s, hot_ms, idle };
 
         // Escalation runs regardless of current load.
         if t.flags & TERM_SENT != 0 {
             if t.flags & DONE == 0 && now32.wrapping_sub(t.term_at) as u64 >= pol.grace_ms {
-                out.push(act(Act::Kill, 0));
+                out.push(act(Act::Kill, 0, false));
                 t.flags |= DONE;
             }
             return;
         }
         if self.rebase {
-            t.flags &= !HOT;
+            t.flags &= !(HOT | IDLE);
             return;
         }
 
+        let alive = !matches!(p.state, State::Zombie | State::Stop);
         let over = cpu_pct >= pol.cpu_pct || (pol.mem_bytes > 0 && p.rss >= pol.mem_bytes);
-        let hot = over && age_s >= pol.min_age_s && !matches!(p.state, State::Zombie | State::Stop);
-        if !hot {
-            t.flags &= !(HOT | DONE);
+        let hot = over && age_s >= pol.min_age_s && alive;
+        // Detached from whoever started it, and doing nothing.
+        let idle = pol.idle_ms > 0 && p.ppid == 1 && cpu_pct < IDLE_CPU_PCT && alive;
+        if !hot && !idle {
+            t.flags &= !(HOT | IDLE | DONE);
             return;
         }
         if t.flags & DONE != 0 {
             return;
         }
-        if t.flags & HOT == 0 {
-            // It was already over threshold during the window that just ended.
+        // Each condition was already true during the window that just ended.
+        if !hot {
+            t.flags &= !HOT;
+        } else if t.flags & HOT == 0 {
             t.flags |= HOT;
             t.hot_since = (now - dt) as u32;
         }
-        let hot_ms = now32.wrapping_sub(t.hot_since) as u64;
-        if hot_ms < pol.sustain_ms {
-            return;
+        if !idle {
+            t.flags &= !IDLE;
+        } else if t.flags & IDLE == 0 {
+            t.flags |= IDLE;
+            t.idle_since = (now - dt) as u32;
         }
+        let hot_ms = if hot { now32.wrapping_sub(t.hot_since) as u64 } else { 0 };
+        let idle_ms = if idle { now32.wrapping_sub(t.idle_since) as u64 } else { 0 };
+        let (for_ms, by_idle) = if hot && hot_ms >= pol.sustain_ms {
+            (hot_ms, false)
+        } else if idle && idle_ms >= pol.idle_ms {
+            (idle_ms, true)
+        } else {
+            return;
+        };
         if protected(p) {
-            out.push(act(Act::Spare, hot_ms));
+            out.push(act(Act::Spare, for_ms, by_idle));
             t.flags |= DONE;
         } else if pol.dry_run {
-            out.push(act(Act::WouldKill, hot_ms));
+            out.push(act(Act::WouldKill, for_ms, by_idle));
             t.flags |= DONE;
         } else {
-            out.push(act(Act::Term, hot_ms));
+            out.push(act(Act::Term, for_ms, by_idle));
             t.flags |= TERM_SENT;
             t.term_at = now32;
         }
@@ -228,6 +275,8 @@ impl Engine {
 
 pub struct Opts {
     pub policy: Policy,
+    pub fast_policy: Policy,
+    fast: Vec<String>,
     protect: Vec<String>,
     include_apps: bool,
     notify: bool,
@@ -247,13 +296,29 @@ pub fn default_policy() -> Policy {
         sustain_ms: 10 * 60_000,
         grace_ms: 15_000,
         interval_ms: 30_000,
+        idle_ms: 0,
         dry_run: false,
     }
 }
 
+pub fn default_fast_policy() -> Policy {
+    Policy {
+        min_age_s: 10 * 60,
+        mem_bytes: 2 << 30,
+        sustain_ms: 2 * 60_000,
+        grace_ms: 5_000,
+        idle_ms: 10 * 60_000,
+        ..default_policy()
+    }
+}
+
+const FAST_DEFAULT: &[&str] = &["agent-browser", "Chrome for Testing"];
+
 pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Opts, String> {
     let mut o = Opts {
         policy: default_policy(),
+        fast_policy: default_fast_policy(),
+        fast: FAST_DEFAULT.iter().map(|s| s.to_string()).collect(),
         protect: Vec::new(),
         include_apps: false,
         notify: true,
@@ -265,6 +330,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Opts, String
     while let Some(a) = args.next() {
         let mut val = |name: &str| args.next().ok_or_else(|| format!("{name} expects a value"));
         let p = &mut o.policy;
+        let f = &mut o.fast_policy;
         match a.as_str() {
             "--min-age" => p.min_age_s = parse_dur(&val(&a)?)? / 1000,
             "--cpu" => {
@@ -276,6 +342,12 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Opts, String
             "--interval" => p.interval_ms = parse_dur(&val(&a)?)?.max(100),
             "--grace" => p.grace_ms = parse_dur(&val(&a)?)?,
             "--protect" => o.protect.push(val(&a)?),
+            "--fast" => o.fast.push(val(&a)?),
+            "--no-fast" => o.fast.clear(),
+            "--fast-min-age" => f.min_age_s = parse_dur(&val(&a)?)? / 1000,
+            "--fast-sustain" => f.sustain_ms = parse_dur(&val(&a)?)?,
+            "--fast-mem" => f.mem_bytes = parse_mem(&val(&a)?)?,
+            "--fast-idle" => f.idle_ms = parse_dur(&val(&a)?)?,
             "--include-apps" => o.include_apps = true,
             "--dry-run" => p.dry_run = true,
             "--no-notify" => o.notify = false,
@@ -295,6 +367,10 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Opts, String
             _ => return Err(format!("unknown option: {a}")),
         }
     }
+    // The fast lane shares what is not lane-specific.
+    let (p, f) = (&o.policy, &mut o.fast_policy);
+    (f.cpu_pct, f.interval_ms, f.dry_run) = (p.cpu_pct, p.interval_ms, p.dry_run);
+    f.grace_ms = f.grace_ms.min(p.grace_ms);
     Ok(o)
 }
 
@@ -361,8 +437,20 @@ pub fn run(args: impl Iterator<Item = String>) {
         pol.grace_ms,
         if pol.dry_run { " DRY-RUN" } else { "" },
     ));
+    if !o.fast.is_empty() {
+        let f = &o.fast_policy;
+        log.write(format_args!(
+            "FAST-LANE {:?} min-age={} mem>={} sustain={} idle={} grace={}ms",
+            o.fast,
+            Dur(f.min_age_s),
+            Bytes(f.mem_bytes),
+            Dur(f.sustain_ms / 1000),
+            if f.idle_ms == 0 { "off".to_string() } else { Dur(f.idle_ms / 1000).to_string() },
+            f.grace_ms,
+        ));
+    }
 
-    let mut engine = Engine::new(o.policy);
+    let mut engine = Engine::new(o.policy, o.fast_policy);
     let mut actions: Vec<Action> = Vec::with_capacity(16);
     let mut path_buf = [0u8; PATH_MAX];
     let mut tick = 0u64;
@@ -378,7 +466,8 @@ pub fn run(args: impl Iterator<Item = String>) {
                 return;
             }
             let age_s = wall_s.saturating_sub(p.start);
-            engine.observe(&p, age_s, |p| is_protected(p, &o, &mut path_buf), &mut actions);
+            let fast = o.fast.iter().any(|n| p.name().contains(n.as_str()));
+            engine.observe(&p, age_s, fast, |p| is_protected(p, &o, &mut path_buf), &mut actions);
         });
         engine.end_tick();
 
@@ -413,12 +502,13 @@ fn execute(a: &Action, me: u32, o: &Opts, log: &Log) {
         Act::Spare => ("SPARED", true),
     };
     log.write(format_args!(
-        "{tag}{} pid={} age={} cpu={:.0}% rss={} hot-for={} cmd={}",
+        "{tag}{} pid={} age={} cpu={:.0}% rss={} {}-for={} cmd={}",
         if ok { "" } else { "(failed)" },
         a.pid,
         Dur(a.age_s),
         a.cpu_pct,
         Bytes(a.rss),
+        if a.idle { "idle" } else { "hot" },
         Dur(a.hot_ms / 1000),
         cmd.as_str(),
     ));
@@ -431,8 +521,9 @@ fn execute(a: &Action, me: u32, o: &Opts, log: &Log) {
         };
         let _ = write!(
             msg,
-            "{} pid {} ({:.0}% CPU, {}, up {}): {short}",
+            "{}{} pid {} ({:.0}% CPU, {}, up {}): {short}",
             if a.act == Act::Term { "Killed" } else { "Would kill" },
+            if a.idle { " idle" } else { "" },
             a.pid,
             a.cpu_pct,
             Bytes(a.rss),
@@ -560,8 +651,13 @@ mod tests {
             sustain_ms: 10 * MIN,
             grace_ms: 15_000,
             interval_ms: 30_000,
+            idle_ms: 0,
             dry_run: false,
         }
+    }
+
+    fn fast_policy() -> Policy {
+        Policy { min_age_s: 600, mem_bytes: 2 << 30, sustain_ms: 2 * MIN, idle_ms: 10 * MIN, ..policy() }
     }
 
     fn proc_(pid: u32, start: u64) -> Proc {
@@ -579,12 +675,13 @@ mod tests {
         p: Proc,
         now: u64,
         out: Vec<(u64, Action)>,
+        fast: bool,
     }
 
     impl Sim {
         fn new(pol: Policy, age_s: u64) -> Self {
             let now = 1_000_000 * 1000;
-            Sim { e: Engine::new(pol), p: proc_(42, now / 1000 - age_s), now, out: Vec::new() }
+            Sim { e: Engine::new(pol, fast_policy()), p: proc_(42, now / 1000 - age_s), now, out: Vec::new(), fast: false }
         }
 
         fn run(&mut self, secs: u64, load_pct: f64, protected: bool) {
@@ -595,7 +692,7 @@ mod tests {
                 let mut acts = Vec::new();
                 self.e.begin_tick(self.now);
                 let age = self.now / 1000 - self.p.start;
-                self.e.observe(&self.p, age, |_| protected, &mut acts);
+                self.e.observe(&self.p, age, self.fast, |_| protected, &mut acts);
                 self.e.end_tick();
                 self.out.extend(acts.into_iter().map(|a| (self.now, a)));
             }
@@ -716,16 +813,81 @@ mod tests {
 
     #[test]
     fn gone_processes_are_forgotten() {
-        let mut e = Engine::new(policy());
+        let mut e = Engine::new(policy(), fast_policy());
         e.begin_tick(1000);
-        e.observe(&proc_(1, 0), 0, |_| false, &mut Vec::new());
-        e.observe(&proc_(2, 0), 0, |_| false, &mut Vec::new());
+        e.observe(&proc_(1, 0), 0, false, |_| false, &mut Vec::new());
+        e.observe(&proc_(2, 0), 0, false, |_| false, &mut Vec::new());
         e.end_tick();
         assert_eq!(e.tracked(), 2);
         e.begin_tick(2000);
-        e.observe(&proc_(2, 0), 0, |_| false, &mut Vec::new());
+        e.observe(&proc_(2, 0), 0, false, |_| false, &mut Vec::new());
         e.end_tick();
         assert_eq!(e.tracked(), 1);
+    }
+
+    fn fast_sim(age_s: u64, ppid: u32) -> Sim {
+        let mut s = Sim::new(policy(), age_s);
+        s.fast = true;
+        s.p.ppid = ppid;
+        s
+    }
+
+    #[test]
+    fn fast_lane_kills_a_hot_browser_within_minutes() {
+        let mut s = fast_sim(15 * 60, 500);
+        s.run(2 * 60, 150.0, false);
+        assert!(s.acts().is_empty());
+        s.run(30, 150.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+        s.run(30, 150.0, false);
+        assert_eq!(s.acts(), [Act::Term, Act::Kill], "fast grace (5s) < one tick");
+    }
+
+    #[test]
+    fn fast_lane_lowers_the_memory_bar() {
+        let mut s = fast_sim(15 * 60, 500);
+        s.p.rss = 3 << 30;
+        s.run(2 * 60 + 30, 0.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+        let mut slow = Sim::new(policy(), 5 * H);
+        slow.p.rss = 3 << 30;
+        slow.run(60 * 60, 0.0, false);
+        assert!(slow.acts().is_empty(), "same process outside the lane is fine");
+    }
+
+    #[test]
+    fn detached_idle_browser_is_killed_as_abandoned() {
+        let mut s = fast_sim(60, 1);
+        s.run(10 * 60, 0.0, false);
+        assert!(s.acts().is_empty());
+        s.run(30, 0.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+        assert!(s.out[0].1.idle);
+    }
+
+    #[test]
+    fn a_browser_in_use_is_not_idle() {
+        let mut s = fast_sim(60, 1);
+        for _ in 0..4 {
+            s.run(8 * 60, 0.0, false);
+            s.run(30, 20.0, false); // a command came in
+        }
+        assert!(s.acts().is_empty());
+    }
+
+    #[test]
+    fn idle_rule_needs_a_detached_process() {
+        let mut s = fast_sim(60, 500); // Chrome under its daemon
+        s.run(60 * 60, 0.0, false);
+        assert!(s.acts().is_empty());
+    }
+
+    #[test]
+    fn idle_rule_is_off_outside_the_fast_lane() {
+        let mut s = Sim::new(policy(), 5 * H);
+        s.p.ppid = 1;
+        s.run(60 * 60, 0.0, false);
+        assert!(s.acts().is_empty());
     }
 
     #[test]
@@ -745,5 +907,16 @@ mod tests {
         assert_eq!(parse_mem("0").unwrap(), 0);
         assert!(parse_mem("50%").unwrap() > 0);
         assert!(parse_mem("lots").is_err());
+    }
+
+    #[test]
+    fn fast_lane_shares_cpu_and_dry_run() {
+        let o = parse_args(["--cpu", "60", "--dry-run", "--grace", "2s"].map(String::from).into_iter()).unwrap();
+        assert_eq!(o.fast_policy.cpu_pct, 60.0);
+        assert!(o.fast_policy.dry_run);
+        assert_eq!(o.fast_policy.grace_ms, 2_000);
+        assert_eq!(o.fast, FAST_DEFAULT);
+        let o = parse_args(["--no-fast", "--fast", "puppeteer"].map(String::from).into_iter()).unwrap();
+        assert_eq!(o.fast, ["puppeteer"]);
     }
 }

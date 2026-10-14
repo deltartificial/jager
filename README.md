@@ -27,6 +27,8 @@ A process is killed when **all** of these hold:
 3. it has used ≥ `--cpu` of a core (default **80%**) or ≥ `--mem` of RSS (default **25% of RAM**) for `--sustain` in a row (default **10 min**, sampled every 30 s);
 4. it is not protected: system paths, GUI apps in `/Applications` (unless `--include-apps`), and anything matching `--protect NAME`.
 
+**Fast lane** for browsers driven by agents (names containing `agent-browser` or `Chrome for Testing`, change with `--fast NAME` / `--no-fast`): min age **10 min**, sustain **2 min**, memory bar **2 GB**, grace 5 s. A detached one (parent = launchd) that stays under 1% CPU for `--fast-idle` (**10 min**) is taken as abandoned by its session and killed; killing the `agent-browser` daemon closes its whole Chrome.
+
 It gets `SIGTERM`, then `SIGKILL` after `--grace` (15 s). The pid's start time and owner are re-checked before each signal, so a recycled pid is never hit. Time spent asleep never counts as hot.
 
 Every decision goes to `~/Library/Logs/jager.log`, plus a macOS notification:
