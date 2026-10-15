@@ -9,6 +9,10 @@
 //! go through a faster lane: shorter age and sustain, a lower memory bar,
 //! and a detached one (parent = launchd) that sits idle is taken as
 //! abandoned by the session that started it.
+//!
+//! Dev servers and agent sessions (`node`, `next-server`, `claude`) go
+//! through a stale lane: past `max_age`, one that stays quiet is taken as
+//! forgotten, even while its parent is still alive.
 
 use crate::proc::{self, PATH_MAX, Proc, SIGKILL, SIGTERM, State};
 use crate::util::{Bytes, Dur, StackBuf, now_ms, parse_dur};
@@ -37,6 +41,11 @@ are also killed when detached (parent = launchd) and idle (< 1% CPU) for
 --fast-idle: an agent's browser left behind after its session ended.
 Killing the agent-browser daemon closes its whole Chrome.
 
+Stale lane: processes whose name contains a --stale pattern (default: node,
+next-server, claude) are also killed once older than --max-age and quiet
+(< --stale-cpu) for --stale-idle: a dev server or a Claude session forgotten
+for a day. Busy ones are left alone until they calm down.
+
 OPTIONS:
   --min-age DUR     minimum age before it can be hunted (default: 3h)
   --cpu PCT         CPU threshold, % of one core (default: 80)
@@ -54,6 +63,12 @@ OPTIONS:
   --fast-mem SIZE|PCT (default: 2G)
   --fast-idle DUR   kill a detached fast-lane process idle this long,
                     0 = off (default: 10m)
+  --stale NAME      add a stale-lane name pattern (repeatable)
+  --no-stale        no stale lane
+  --max-age DUR     age past which a quiet stale-lane process goes,
+                    0 = off (default: 24h)
+  --stale-idle DUR  how long it must stay quiet (default: 15m)
+  --stale-cpu PCT   below this it counts as quiet (default: 5)
   --dry-run         log and notify, but never send a signal
   --no-notify       no macOS notifications
   --log PATH        log file (default: ~/Library/Logs/jager.log, - = stderr)
@@ -82,13 +97,24 @@ pub struct Policy {
     pub sustain_ms: u64,
     pub grace_ms: u64,
     pub interval_ms: u64,
-    /// Detached and idle this long = abandoned. 0 = rule off.
+    /// Idle this long = abandoned. 0 = rule off.
     pub idle_ms: u64,
+    /// Below this, a tick counts as idle.
+    pub idle_cpu_pct: f32,
+    /// The idle rule only applies past this age...
+    pub idle_min_age_s: u64,
+    /// ...and, when set, only to detached processes (parent = launchd).
+    pub idle_detached: bool,
     pub dry_run: bool,
 }
 
-/// Below this, a tick counts as idle.
-const IDLE_CPU_PCT: f32 = 1.0;
+/// Which policy a process is judged by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    Normal,
+    Fast,
+    Stale,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Act {
@@ -150,6 +176,8 @@ pub struct Engine {
     pub policy: Policy,
     /// Policy of the fast lane.
     pub fast: Policy,
+    /// Policy of the stale lane.
+    pub stale: Policy,
     tracks: Vec<Track>,
     now: u64,
     dt: u64,
@@ -159,8 +187,8 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(policy: Policy, fast: Policy) -> Self {
-        Engine { policy, fast, tracks: Vec::with_capacity(1024), now: 0, dt: 0, last_tick: None, rebase: false }
+    pub fn new(policy: Policy, fast: Policy, stale: Policy) -> Self {
+        Engine { policy, fast, stale, tracks: Vec::with_capacity(1024), now: 0, dt: 0, last_tick: None, rebase: false }
     }
 
     pub fn tracked(&self) -> usize {
@@ -174,13 +202,13 @@ impl Engine {
     }
 
     /// `age_s` is supplied by the caller so time can be warped in tests.
-    /// `fast` puts the process in the fast lane.
+    /// `protected` is told whether the idle rule fired.
     pub fn observe(
         &mut self,
         p: &Proc,
         age_s: u64,
-        fast: bool,
-        mut protected: impl FnMut(&Proc) -> bool,
+        lane: Lane,
+        mut protected: impl FnMut(&Proc, bool) -> bool,
         out: &mut Vec<Action>,
     ) {
         let idx = match self.tracks.binary_search_by_key(&p.pid, |t| t.pid) {
@@ -189,7 +217,11 @@ impl Engine {
             Ok(i) => return self.tracks[i] = Track::new(p),
             Err(i) => return self.tracks.insert(i, Track::new(p)),
         };
-        let pol = if fast { &self.fast } else { &self.policy };
+        let pol = match lane {
+            Lane::Normal => &self.policy,
+            Lane::Fast => &self.fast,
+            Lane::Stale => &self.stale,
+        };
         let (now, dt) = (self.now, self.dt);
         let now32 = now as u32;
         let t = &mut self.tracks[idx];
@@ -218,8 +250,12 @@ impl Engine {
         let alive = !matches!(p.state, State::Zombie | State::Stop);
         let over = cpu_pct >= pol.cpu_pct || (pol.mem_bytes > 0 && p.rss >= pol.mem_bytes);
         let hot = over && age_s >= pol.min_age_s && alive;
-        // Detached from whoever started it, and doing nothing.
-        let idle = pol.idle_ms > 0 && p.ppid == 1 && cpu_pct < IDLE_CPU_PCT && alive;
+        // Left behind (detached, or simply too old) and doing nothing.
+        let idle = pol.idle_ms > 0
+            && cpu_pct < pol.idle_cpu_pct
+            && age_s >= pol.idle_min_age_s
+            && (p.ppid == 1 || !pol.idle_detached)
+            && alive;
         if !hot && !idle {
             t.flags &= !(HOT | IDLE | DONE);
             return;
@@ -249,7 +285,7 @@ impl Engine {
         } else {
             return;
         };
-        if protected(p) {
+        if protected(p, by_idle) {
             out.push(act(Act::Spare, for_ms, by_idle));
             t.flags |= DONE;
         } else if pol.dry_run {
@@ -276,7 +312,9 @@ impl Engine {
 pub struct Opts {
     pub policy: Policy,
     pub fast_policy: Policy,
+    pub stale_policy: Policy,
     fast: Vec<String>,
+    stale: Vec<String>,
     protect: Vec<String>,
     include_apps: bool,
     notify: bool,
@@ -297,6 +335,9 @@ pub fn default_policy() -> Policy {
         grace_ms: 15_000,
         interval_ms: 30_000,
         idle_ms: 0,
+        idle_cpu_pct: 1.0,
+        idle_min_age_s: 0,
+        idle_detached: true,
         dry_run: false,
     }
 }
@@ -312,13 +353,28 @@ pub fn default_fast_policy() -> Policy {
     }
 }
 
+/// Same hot rules as the normal lane, plus the age-based idle rule.
+pub fn default_stale_policy() -> Policy {
+    Policy {
+        idle_ms: 15 * 60_000,
+        // An idle Claude session still ticks at ~1-2% of a core.
+        idle_cpu_pct: 5.0,
+        idle_min_age_s: 24 * 3600,
+        idle_detached: false,
+        ..default_policy()
+    }
+}
+
 const FAST_DEFAULT: &[&str] = &["agent-browser", "Chrome for Testing"];
+const STALE_DEFAULT: &[&str] = &["node", "next-server", "claude"];
 
 pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Opts, String> {
     let mut o = Opts {
         policy: default_policy(),
         fast_policy: default_fast_policy(),
+        stale_policy: default_stale_policy(),
         fast: FAST_DEFAULT.iter().map(|s| s.to_string()).collect(),
+        stale: STALE_DEFAULT.iter().map(|s| s.to_string()).collect(),
         protect: Vec::new(),
         include_apps: false,
         notify: true,
@@ -348,6 +404,15 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Opts, String
             "--fast-sustain" => f.sustain_ms = parse_dur(&val(&a)?)?,
             "--fast-mem" => f.mem_bytes = parse_mem(&val(&a)?)?,
             "--fast-idle" => f.idle_ms = parse_dur(&val(&a)?)?,
+            "--stale" => o.stale.push(val(&a)?),
+            "--no-stale" => o.stale.clear(),
+            "--max-age" => o.stale_policy.idle_min_age_s = parse_dur(&val(&a)?)? / 1000,
+            "--stale-idle" => o.stale_policy.idle_ms = parse_dur(&val(&a)?)?,
+            "--stale-cpu" => {
+                let v = val(&a)?;
+                o.stale_policy.idle_cpu_pct =
+                    v.trim_end_matches('%').parse().map_err(|_| format!("invalid --stale-cpu: {v}"))?
+            }
             "--include-apps" => o.include_apps = true,
             "--dry-run" => p.dry_run = true,
             "--no-notify" => o.notify = false,
@@ -371,6 +436,15 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Opts, String
     let (p, f) = (&o.policy, &mut o.fast_policy);
     (f.cpu_pct, f.interval_ms, f.dry_run) = (p.cpu_pct, p.interval_ms, p.dry_run);
     f.grace_ms = f.grace_ms.min(p.grace_ms);
+    // The stale lane is the normal lane plus its idle rule.
+    let st = &mut o.stale_policy;
+    *st = Policy {
+        idle_ms: if st.idle_min_age_s == 0 { 0 } else { st.idle_ms },
+        idle_cpu_pct: st.idle_cpu_pct,
+        idle_min_age_s: st.idle_min_age_s,
+        idle_detached: false,
+        ..o.policy
+    };
     Ok(o)
 }
 
@@ -394,9 +468,11 @@ fn parse_mem(s: &str) -> Result<u64, String> {
     Ok((n * mult as f64) as u64)
 }
 
-fn is_protected(p: &Proc, o: &Opts, buf: &mut [u8; PATH_MAX]) -> bool {
+/// `stale_idle`: the stale lane's idle rule fired, which may reach the
+/// protected names (a forgotten `claude` session); the path rules still hold.
+fn is_protected(p: &Proc, o: &Opts, stale_idle: bool, buf: &mut [u8; PATH_MAX]) -> bool {
     let name = p.name();
-    if PROTECTED.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+    if !stale_idle && PROTECTED.iter().any(|n| n.eq_ignore_ascii_case(name)) {
         return true;
     }
     // Unknown path: when in doubt, don't shoot.
@@ -449,8 +525,18 @@ pub fn run(args: impl Iterator<Item = String>) {
             f.grace_ms,
         ));
     }
+    if !o.stale.is_empty() && o.stale_policy.idle_ms > 0 {
+        let s = &o.stale_policy;
+        log.write(format_args!(
+            "STALE-LANE {:?} max-age={} idle={} cpu<{}%",
+            o.stale,
+            Dur(s.idle_min_age_s),
+            Dur(s.idle_ms / 1000),
+            s.idle_cpu_pct,
+        ));
+    }
 
-    let mut engine = Engine::new(o.policy, o.fast_policy);
+    let mut engine = Engine::new(o.policy, o.fast_policy, o.stale_policy);
     let mut actions: Vec<Action> = Vec::with_capacity(16);
     let mut path_buf = [0u8; PATH_MAX];
     let mut tick = 0u64;
@@ -466,8 +552,21 @@ pub fn run(args: impl Iterator<Item = String>) {
                 return;
             }
             let age_s = wall_s.saturating_sub(p.start);
-            let fast = o.fast.iter().any(|n| p.name().contains(n.as_str()));
-            engine.observe(&p, age_s, fast, |p| is_protected(p, &o, &mut path_buf), &mut actions);
+            let has = |pats: &[String]| pats.iter().any(|n| p.name().contains(n.as_str()));
+            let lane = if has(&o.fast) {
+                Lane::Fast
+            } else if has(&o.stale) {
+                Lane::Stale
+            } else {
+                Lane::Normal
+            };
+            engine.observe(
+                &p,
+                age_s,
+                lane,
+                |p, by_idle| is_protected(p, &o, lane == Lane::Stale && by_idle, &mut path_buf),
+                &mut actions,
+            );
         });
         engine.end_tick();
 
@@ -652,12 +751,19 @@ mod tests {
             grace_ms: 15_000,
             interval_ms: 30_000,
             idle_ms: 0,
+            idle_cpu_pct: 1.0,
+            idle_min_age_s: 0,
+            idle_detached: true,
             dry_run: false,
         }
     }
 
     fn fast_policy() -> Policy {
         Policy { min_age_s: 600, mem_bytes: 2 << 30, sustain_ms: 2 * MIN, idle_ms: 10 * MIN, ..policy() }
+    }
+
+    fn stale_policy() -> Policy {
+        Policy { idle_ms: 15 * MIN, idle_cpu_pct: 5.0, idle_min_age_s: 24 * H, idle_detached: false, ..policy() }
     }
 
     fn proc_(pid: u32, start: u64) -> Proc {
@@ -675,13 +781,19 @@ mod tests {
         p: Proc,
         now: u64,
         out: Vec<(u64, Action)>,
-        fast: bool,
+        lane: Lane,
     }
 
     impl Sim {
         fn new(pol: Policy, age_s: u64) -> Self {
             let now = 1_000_000 * 1000;
-            Sim { e: Engine::new(pol, fast_policy()), p: proc_(42, now / 1000 - age_s), now, out: Vec::new(), fast: false }
+            Sim {
+                e: Engine::new(pol, fast_policy(), stale_policy()),
+                p: proc_(42, now / 1000 - age_s),
+                now,
+                out: Vec::new(),
+                lane: Lane::Normal,
+            }
         }
 
         fn run(&mut self, secs: u64, load_pct: f64, protected: bool) {
@@ -692,7 +804,7 @@ mod tests {
                 let mut acts = Vec::new();
                 self.e.begin_tick(self.now);
                 let age = self.now / 1000 - self.p.start;
-                self.e.observe(&self.p, age, self.fast, |_| protected, &mut acts);
+                self.e.observe(&self.p, age, self.lane, |_, _| protected, &mut acts);
                 self.e.end_tick();
                 self.out.extend(acts.into_iter().map(|a| (self.now, a)));
             }
@@ -813,21 +925,21 @@ mod tests {
 
     #[test]
     fn gone_processes_are_forgotten() {
-        let mut e = Engine::new(policy(), fast_policy());
+        let mut e = Engine::new(policy(), fast_policy(), stale_policy());
         e.begin_tick(1000);
-        e.observe(&proc_(1, 0), 0, false, |_| false, &mut Vec::new());
-        e.observe(&proc_(2, 0), 0, false, |_| false, &mut Vec::new());
+        e.observe(&proc_(1, 0), 0, Lane::Normal, |_, _| false, &mut Vec::new());
+        e.observe(&proc_(2, 0), 0, Lane::Normal, |_, _| false, &mut Vec::new());
         e.end_tick();
         assert_eq!(e.tracked(), 2);
         e.begin_tick(2000);
-        e.observe(&proc_(2, 0), 0, false, |_| false, &mut Vec::new());
+        e.observe(&proc_(2, 0), 0, Lane::Normal, |_, _| false, &mut Vec::new());
         e.end_tick();
         assert_eq!(e.tracked(), 1);
     }
 
     fn fast_sim(age_s: u64, ppid: u32) -> Sim {
         let mut s = Sim::new(policy(), age_s);
-        s.fast = true;
+        s.lane = Lane::Fast;
         s.p.ppid = ppid;
         s
     }
@@ -888,6 +1000,72 @@ mod tests {
         s.p.ppid = 1;
         s.run(60 * 60, 0.0, false);
         assert!(s.acts().is_empty());
+    }
+
+    fn stale_sim(age_s: u64) -> Sim {
+        let mut s = Sim::new(policy(), age_s);
+        s.lane = Lane::Stale;
+        s.p.ppid = 500; // its session is still alive
+        s
+    }
+
+    #[test]
+    fn forgotten_dev_server_is_killed_after_max_age() {
+        let mut s = stale_sim(30 * H);
+        s.p.rss = 5 << 30;
+        s.run(15 * 60, 0.0, false);
+        assert!(s.acts().is_empty());
+        s.run(30, 0.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+        assert!(s.out[0].1.idle);
+    }
+
+    #[test]
+    fn idle_claude_session_ticking_at_two_percent_counts_as_quiet() {
+        let mut s = stale_sim(30 * H);
+        s.run(15 * 60 + 30, 2.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+    }
+
+    #[test]
+    fn stale_lane_waits_for_max_age() {
+        let mut s = stale_sim(23 * H);
+        s.run(50 * 60, 0.0, false);
+        assert!(s.acts().is_empty());
+        s.run(24 * 60, 0.0, false);
+        assert!(s.acts().is_empty(), "quiet time counts only past max-age");
+        s.run(30, 0.0, false);
+        assert_eq!(s.acts(), [Act::Term]);
+        assert_eq!(s.out[0].1.hot_ms, 15 * MIN);
+    }
+
+    #[test]
+    fn busy_old_session_is_left_alone() {
+        let mut s = stale_sim(30 * H);
+        for _ in 0..6 {
+            s.run(10 * 60, 0.0, false);
+            s.run(30, 30.0, false); // working
+        }
+        assert!(s.acts().is_empty());
+    }
+
+    #[test]
+    fn stale_idle_rule_is_off_in_the_normal_lane() {
+        let mut s = Sim::new(policy(), 30 * H);
+        s.run(60 * 60, 0.0, false);
+        assert!(s.acts().is_empty());
+    }
+
+    #[test]
+    fn stale_lane_options() {
+        let o = parse_args(["--max-age", "12h", "--stale-cpu", "3", "--dry-run"].map(String::from).into_iter()).unwrap();
+        assert_eq!(o.stale_policy.idle_min_age_s, 12 * H);
+        assert_eq!(o.stale_policy.idle_cpu_pct, 3.0);
+        assert!(o.stale_policy.dry_run);
+        assert!(!o.stale_policy.idle_detached);
+        assert_eq!(o.stale, STALE_DEFAULT);
+        let o = parse_args(["--max-age", "0"].map(String::from).into_iter()).unwrap();
+        assert_eq!(o.stale_policy.idle_ms, 0);
     }
 
     #[test]

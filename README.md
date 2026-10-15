@@ -29,6 +29,8 @@ A process is killed when **all** of these hold:
 
 **Fast lane** for browsers driven by agents (names containing `agent-browser` or `Chrome for Testing`, change with `--fast NAME` / `--no-fast`): min age **10 min**, sustain **2 min**, memory bar **2 GB**, grace 5 s. A detached one (parent = launchd) that stays under 1% CPU for `--fast-idle` (**10 min**) is taken as abandoned by its session and killed; killing the `agent-browser` daemon closes its whole Chrome.
 
+**Stale lane** for dev servers and agent sessions (names containing `node`, `next-server` or `claude`, change with `--stale NAME` / `--no-stale`): once older than `--max-age` (**24h**), one that stays under `--stale-cpu` (**5%**, an idle Claude session still ticks at 1-2%) for `--stale-idle` (**15 min**) is taken as forgotten and killed, even if the session that started it is still open. A busy one is left alone until it calms down.
+
 It gets `SIGTERM`, then `SIGKILL` after `--grace` (15 s). The pid's start time and owner are re-checked before each signal, so a recycled pid is never hit. Time spent asleep never counts as hot.
 
 Every decision goes to `~/Library/Logs/jager.log`, plus a macOS notification:
